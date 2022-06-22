@@ -1,0 +1,175 @@
+version: 2.1
+orbs:
+   slack: circleci/slack@4.10.1
+   
+executors: 
+   node-executor:
+      docker:
+       - image: cimg/node:18.4.0
+       
+references: 
+   shallow_checkout: &SHALLOW_CHECKOUT
+      run:
+         name: Shallow repository checkout
+         command: |
+           mkdir -p $HOME/.ssh
+           ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+           cd ~
+           rm -r ~/project
+           BRANCH=$CIRCLE_BRANCH
+           if [ -z "$BRANCH" ];
+           then
+           BRANCH=$CIRCLE_TAG
+           fi
+           git clone --single-branch --depth 1 "$CIRCLE_REPOSITORY_URL" --branch "$BRANCH" ~/project
+   slack_notify_failure: &SLACK_NOTIFY_FAIL
+      slack/notify:
+         branch_pattern: main
+         event: fail
+         template: basic_fail_1
+
+
+
+
+
+
+jobs: 
+  build-frontend-dependencies:
+    executor: node-executor
+    working_directory: ~/project/frontend
+    steps:
+      - *SHALLOW_CHECKOUT
+      - attach_workspace: 
+           at: /tmp/workspace 
+      - run:
+          name: Generate pnpm cache file to checksum
+          command: find . -name 'pnpm-lock.yaml' | sort | xargs cat | shasum | awk '{print $1}' > /tmp/pnpm_lock_seed
+      - restore_cache:
+          keys:
+            - pnpm-6-{{ checksum "/tmp/pnpm_lock_seed" }}
+      - restore_cache:
+          keys:
+            - rush-{{ checksum "~/project/frontend/rush.json" }}
+      - run: node common/scripts/install-run-rush.js install
+      - run: mkdir build
+      - run:
+          name: Build Dependencies
+          command: RUSH_BUILD_CACHE_CREDENTIAL=$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY node common/scripts/install-run-rush.js build -T @brace/borrower-frontend -T @brace/servicer --verbose
+      - save_cache:
+          key: rush-{{ checksum "~/project/frontend/rush.json" }}
+          paths:
+            - common/temp/install-run
+            - ~/.rush
+      - save_cache:
+          key: pnpm-6-{{ checksum "/tmp/pnpm_lock_seed" }}
+          paths:
+            - common/temp/pnpm-store
+      - *SLACK_NOTIFY_FAIL
+  build-frontends:
+    executor: node-executor
+    working_directory: ~/project/frontend
+    steps:
+      - *SHALLOW_CHECKOUT
+      - attach_workspace: 
+           at: /tmp/workspace 
+      - run:
+          name: Generate pnpm cache file to checksum
+          command: find . -name 'pnpm-lock.yaml' | sort | xargs cat | shasum | awk '{print $1}' > /tmp/pnpm_lock_seed
+      - restore_cache:
+          keys:
+            - pnpm-6-{{ checksum "/tmp/pnpm_lock_seed" }}
+      - restore_cache:
+          keys:
+            - rush-{{ checksum "~/project/frontend/rush.json" }}
+      - run: node common/scripts/install-run-rush.js install
+      - run: mkdir build
+      - run:
+          name: Build Frontends
+          command: |
+            export BUILD_TIME_STAMP="`date`"
+            export GIT_DESCRIBE=$(cat /tmp/workspace/git/describe)
+            RUSH_BUILD_CACHE_CREDENTIAL=$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY node common/scripts/install-run-rush.js build -t @brace/borrower-frontend -t @brace/servicer --verbose
+            echo "${GIT_DESCRIBE}" > ./clients/borrower-frontend/build/version
+            echo "${GIT_DESCRIBE}" > ./clients/servicer/build/version
+            echo "" > ./clients/servicer/build/service-worker.js
+      - run: mkdir -p /tmp/workspace/borrower && mkdir -p /tmp/workspace/servicer
+      - run: mv ./clients/borrower-frontend/build/ /tmp/workspace/borrower/
+      - run: mv ./clients/servicer/build/ /tmp/workspace/servicer/
+      - save_cache:
+          key: rush-{{ checksum "~/project/frontend/rush.json" }}
+          paths:
+            - common/temp/install-run
+            - ~/.rush
+      - save_cache:
+          key: pnpm-6-{{ checksum "/tmp/pnpm_lock_seed" }}
+          paths:
+            - common/temp/pnpm-store
+      - persist_to_workspace:
+          root: /tmp/workspace 
+          paths:
+            - borrower
+            - servicer
+            - frontend-borrower
+      - *SLACK_NOTIFY_FAIL
+
+  borrower-frontend-test-unit:
+    executor: node-executor
+    working_directory: ~/project/frontend
+    steps:
+      - *SHALLOW_CHECKOUT
+      - attach_workspace: 
+           at: /tmp/workspace 
+      - run:
+          name: Generate pnpm cache file to checksum
+          command: find . -name 'pnpm-lock.yaml' | sort | xargs cat | shasum | awk '{print $1}' > /tmp/pnpm_lock_seed
+      - restore_cache:
+          keys:
+            - pnpm-6-{{ checksum "/tmp/pnpm_lock_seed" }}
+      - restore_cache:
+          keys:
+            - rush-{{ checksum "~/project/frontend/rush.json" }}
+      - run:
+          name: Install and Build Dependencies
+          command: |
+            node common/scripts/install-run-rush.js install
+            RUSH_BUILD_CACHE_CREDENTIAL=$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY node common/scripts/install-run-rush.js build -T @brace/borrower-frontend
+      - run:
+          name: Run Unit Tests
+          command: |
+            cd clients/borrower-frontend
+            npm test
+      - store_test_results:
+          path: clients/borrower-frontend/reports
+
+      - *SLACK_NOTIFY_FAIL
+
+  servicer-frontend-test-unit:
+    executor: node-executor
+    working_directory: ~/project/frontend
+    steps:
+      - *SHALLOW_CHECKOUT
+      - attach_workspace: 
+           at: /tmp/workspace 
+      - run:
+          name: Generate pnpm cache file to checksum
+          command: find . -name 'pnpm-lock.yaml' | sort | xargs cat | shasum | awk '{print $1}' > /tmp/pnpm_lock_seed
+      - restore_cache:
+          keys:
+            - pnpm-6-{{ checksum "/tmp/pnpm_lock_seed" }}
+      - restore_cache:
+          keys:
+            - rush-{{ checksum "~/project/frontend/rush.json" }}
+      - run:
+          name: Install and Build Dependencies
+          command: |
+            node common/scripts/install-run-rush.js install
+            RUSH_BUILD_CACHE_CREDENTIAL=$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY node common/scripts/install-run-rush.js build -T @brace/servicer
+      - run:
+          name: Run Unit Tests
+          command: |
+            cd clients/servicer
+            npm test
+      - store_test_results:
+          path: clients/servicer/reports
+
+      - *SLACK_NOTIFY_FAIL

@@ -1,0 +1,414 @@
+version: 2.1
+orbs: 
+   aws-cli: circleci/aws-cli@3.1.1
+   jq: circleci/jq@2.2.0
+   slack: circleci/slack@4.10.1
+   kubernetes: circleci/kubernetes@1.3.0
+   aws-eks: circleci/aws-eks@2.2.0
+
+
+# executors: 
+#     aws-executor:
+#         aws-cli-executor: aws-cli/default
+
+references: 
+
+   shallow_checkout: &SHALLOW_CHECKOUT
+      run:
+         name: Shallow repository checkout
+         command: |
+           mkdir -p $HOME/.ssh
+           ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+           cd ~
+           rm -r ~/project
+           BRANCH=$CIRCLE_BRANCH
+           if [ -z "$BRANCH" ];
+           then
+           BRANCH=$CIRCLE_TAG
+           fi
+           git clone --single-branch --depth 1 "$CIRCLE_REPOSITORY_URL" --branch "$BRANCH" ~/project
+   slack_notify_failure: &SLACK_NOTIFY_FAIL
+      slack/notify:
+         branch_pattern: main
+         event: fail
+         template: basic_fail_1
+
+
+jobs: 
+  run-tests:
+    parameters:
+      env:
+        type: string
+        default: "dev"
+      env_id:
+        type: integer
+        default: 429158029891
+    resource_class: small
+    executor: aws-cli/default
+    steps:
+      - *SHALLOW_CHECKOUT
+      - setup-kubectl:
+          environment_id: << parameters.env_id >>
+          environment_name: << parameters.env >>
+      - jq/install
+      - rerun-job:
+          job_name: "data-delivery-system-test"
+          emoji: ":safety_vest:"
+          environment_name: << parameters.env >>
+      - rerun-job:
+          job_name: "etl-system-test"
+          emoji: ":safety_vest:"
+          environment_name: << parameters.env >>
+      #      Disabled e2e auto restart due to resource utilization
+      #      - rerun-job:
+      #          job_name: "e2e-system-test"
+      #          emoji: ":safety_vest:"
+      #          environment_name: << parameters.env >>
+      - *SLACK_NOTIFY_FAIL
+  auto-deploy:
+    parameters:
+      env:
+        type: string
+        default: "dev"
+      env_id:
+        type: integer
+        default: 429158029891
+    executor: aws-cli/default
+    resource_class: small
+    steps:
+      - *SHALLOW_CHECKOUT
+      - setup-kubectl:
+          environment_id: << parameters.env_id >>
+          environment_name: << parameters.env >>
+      - jq/install
+      #     Disabled e2e test due to memory utiliziation
+      #      - kill-job:
+      #          job_name: "e2e-system-test"
+      - kill-job:
+          job_name: "data-delivery-system-test"
+      - kill-job:
+          job_name: "etl-system-test"
+      - autodeploy-service:
+          service_name: "borrower"
+          environment_name: << parameters.env >>
+      - autodeploy-service:
+          service_name: "servicer"
+          environment_name: << parameters.env >>
+      - autodeploy-service:
+          service_name: "async-worker"
+          environment_name: << parameters.env >>
+      - autodeploy-service:
+          service_name: "dispatch"
+          environment_name: << parameters.env >>
+      - rerun-job:
+          job_name: "frontend-deployer-servicer"
+          emoji: ":sonic:"
+          environment_name: << parameters.env >>
+      - rerun-job:
+          job_name: "frontend-deployer-borrower"
+          emoji: ":sonic:"
+          environment_name: << parameters.env >>
+      - wait-for-service:
+          service_name: "borrower"
+          environment_name: << parameters.env >>
+      - wait-for-service:
+          service_name: "servicer"
+          environment_name: << parameters.env >>
+      - wait-for-service:
+          service_name: "async-worker"
+          environment_name: << parameters.env >>
+      - wait-for-service:
+          service_name: "dispatch"
+          environment_name: << parameters.env >>
+      - wait-for-job:
+          job_name: "frontend-deployer-servicer"
+      - wait-for-job:
+          job_name: "frontend-deployer-borrower"
+      - *SLACK_NOTIFY_FAIL
+  push-fe-artifacts:
+    parameters:
+      tag:
+        type: string
+        default: "latest"
+    executor: aws-cli/default
+    resource_class: small
+    steps:
+      - attach_workspace: 
+           at: /tmp/workspace 
+      - aws-cli/setup
+      - run:
+          name: Overwrite borrower << parameters.tag >> tar in the S3 bucket
+          environment:
+            ARCHIVE_BUCKET: "ai.brace.dev.frontend.builds"
+            ARCHIVE_NAME: "<< parameters.tag >>.tar.gz"
+          command: |
+            cd /tmp/workspace/borrower
+            tar -zcf ${ARCHIVE_NAME} build
+            aws s3 cp ${ARCHIVE_NAME} s3://${ARCHIVE_BUCKET}/borrower/${ARCHIVE_NAME}
+      - run:
+          name: Overwrite servicer << parameters.tag >> tar in the S3 bucket
+          environment:
+            ARCHIVE_BUCKET: "ai.brace.dev.frontend.builds"
+            ARCHIVE_NAME: "<< parameters.tag >>.tar.gz"
+          command: |
+            cd /tmp/workspace/servicer
+            tar -zcf ${ARCHIVE_NAME} build
+            aws s3 cp ${ARCHIVE_NAME} s3://${ARCHIVE_BUCKET}/servicer/${ARCHIVE_NAME}
+      - *SLACK_NOTIFY_FAIL
+  build-push-servicer-image:
+    parameters:
+      tag:
+        type: string
+        default: "latest"
+    executor: aws-cli/default
+    working_directory: ~/project/backend/servicer-api
+    steps:
+      - *SHALLOW_CHECKOUT
+      - build-and-push-backend-docker-image:
+          project: "servicer-api"
+          tag: << parameters.tag >>
+      - *SLACK_NOTIFY_FAIL
+  build-push-borrower-image:
+    parameters:
+      tag:
+        type: string
+        default: "latest"
+    executor: aws-cli/default
+    working_directory: ~/project/backend/borrower-api-vertx
+    steps:
+      - *SHALLOW_CHECKOUT
+      - build-and-push-backend-docker-image:
+          project: "borrower-api-vertx"
+          override_repo: "borrower-api"
+          tag: << parameters.tag >>
+      - *SLACK_NOTIFY_FAIL
+  build-push-async-worker-image:
+    parameters:
+      tag:
+        type: string
+        default: "latest"
+    executor: aws-cli/default
+    working_directory: ~/project/backend/async-worker
+    steps:
+      - *SHALLOW_CHECKOUT
+      - build-and-push-backend-docker-image:
+          project: "async-worker"
+          tag: << parameters.tag >>
+      - *SLACK_NOTIFY_FAIL
+  build-push-dispatch-image:
+    parameters:
+      tag:
+        type: string
+        default: "latest"
+    executor: aws-cli/default
+    working_directory: ~/project/backend/dispatch
+    steps:
+      - *SHALLOW_CHECKOUT
+      - attach_workspace: 
+           at: /tmp/workspace 
+      - aws-cli/setup
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Build docker image
+          environment:
+            REPOSITORY_URL: 838607676327.dkr.ecr.us-east-2.amazonaws.com/brace/dispatch
+            PW_STD_IN: 838607676327.dkr.ecr.us-east-2.amazonaws.com
+            TAG_SUFFIX: << parameters.tag >>
+          command: |
+            HASH="git-${CIRCLE_SHA1}"
+            GIT_DESCRIBE=$(cat /tmp/workspace/git/describe)
+            TIMESTAMP_MS=$(date +%s000)
+            MAIN_TAG=${REPOSITORY_URL}:${TAG_SUFFIX}
+            HASH_TAG=${REPOSITORY_URL}:${HASH}
+            docker build --target build-prod --tag dist:latest .
+            docker build --target dist --tag ${MAIN_TAG} --build-arg build_version=${GIT_DESCRIBE} --build-arg build_timestamp=${TIMESTAMP_MS} .
+            docker tag ${MAIN_TAG} ${HASH_TAG}
+            aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin ${PW_STD_IN}
+            docker push $MAIN_TAG
+            docker push $HASH_TAG
+      - *SLACK_NOTIFY_FAIL
+ 
+#################################               Orbs commands             ########################################
+
+
+commands: 
+     setup-kubectl:
+        parameters:
+            environment_id:
+               description: "The AWS subaccount ID of the environment to target."
+               default: 429158029891
+               type: integer
+            environment_name:
+               description: "The environment name, like 'dev'."
+               default: "dev"
+               type: string
+        steps:
+          - aws-cli/setup
+          - run:
+              name: Fixup profile
+              environment:
+                 ROLE_ARN: "arn:aws:iam::<< parameters.environment_id >>:role/OrganizationAccountAccessRole"
+              command: |
+                 echo "[sub-profile]" >> ~/.aws/credentials
+                 echo "source_profile = default" >> ~/.aws/credentials
+                 echo "role_arn = ${ROLE_ARN}" >> ~/.aws/credentials
+        # Install kubectl explicitly and tag version 1.23.0 due to v1alpha1 ExecCredential api removal
+      # https://github.com/kubernetes/sig-release/blob/master/releases/release-1.24/release-notes/release-notes-draft.json#L5477-L5478
+          - kubernetes/install-kubectl:
+                kubectl-version: v1.23.0
+          - aws-eks/update-kubeconfig-with-authenticator:
+                install-aws-cli: false
+                install-kubectl: false
+                cluster-name: << parameters.environment_name >>-brace
+                aws-profile: sub-profile
+                aws-region: us-east-2
+                cluster-authentication-role-arn: "arn:aws:iam::<< parameters.environment_id >>:role/OrganizationAccountAccessRole"
+                verbose: true
+     build-and-push-backend-docker-image:
+        parameters:
+           project:
+               type: string
+           override_repo:
+               description: This is to allow overriding what the ECR's repo name is because for borrower its not the same as the java project dir name
+               type: string
+               default: ""
+           tag:
+               type: string
+               default: latest
+        steps:
+          - attach_workspace: 
+             at: /tmp/workspace 
+          - aws-cli/setup
+          - setup_remote_docker:
+               docker_layer_caching: true
+          - run:
+              name: Restore shadow tar from workspace
+              environment:
+                  DEST: build/distributions
+                  ARCHIVE: << parameters.project >>-shadow.tar
+              command: |
+                  mkdir -p ${DEST}
+                  cp /tmp/workspace/shadow/${ARCHIVE} ${DEST}/
+          - run:
+              name: Copy in shared binaries
+              command: cp -v ../shared-binaries/* .
+          - run:
+              name: Build docker image
+              environment:
+                  PW_STD_IN: 838607676327.dkr.ecr.us-east-2.amazonaws.com
+                  REPOSITORY_URL: 838607676327.dkr.ecr.us-east-2.amazonaws.com/brace
+                  TAG_SUFFIX: << parameters.tag >>
+              command: |
+                    HASH="git-${CIRCLE_SHA1}"
+                    GIT_DESCRIBE=$(cat /tmp/workspace/git/describe)
+                    TIMESTAMP_MS=$(date +%s000)
+                    if [ ! -z "<< parameters.override_repo >>" ];
+                    then
+                    REPOSITORY_URL="${REPOSITORY_URL}/<< parameters.override_repo >>"
+                    else
+                    REPOSITORY_URL="${REPOSITORY_URL}/<< parameters.project >>"
+                    fi
+                    MAIN_TAG=${REPOSITORY_URL}:${TAG_SUFFIX}
+                    HASH_TAG=${REPOSITORY_URL}:${HASH}
+                    docker build --tag ${MAIN_TAG} --build-arg build_version=${GIT_DESCRIBE} --build-arg build_timestamp=${TIMESTAMP_MS} .
+                    docker tag ${MAIN_TAG} ${HASH_TAG}
+                    aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin ${PW_STD_IN}
+                    docker push $MAIN_TAG
+                    docker push $HASH_TAG
+     autodeploy-service:
+          parameters:
+               service_name:
+                  type: string
+               environment_name:
+                  type: string
+          steps:
+            - run:
+                name: Restart service << parameters.service_name >>
+                environment:
+                    SERVICE_NAME: << parameters.service_name >>
+                    CLUSTER_NAME: << parameters.environment_name >>
+                command: kubectl rollout restart -n "${SERVICE_NAME}" deployment/"${SERVICE_NAME}"-${CLUSTER_NAME}
+            - run:
+                environment:
+                    EMOJI: ":rocket:"
+                    SERVICE_NAME: << parameters.service_name >>
+                    CLUSTER_NAME: << parameters.environment_name >>
+                name: Notify slack
+                command: ./utilities/notify-slack.sh "${EMOJI} Deploying \`${CIRCLE_SHA1}\` (\`${CIRCLE_BRANCH}\`) to ${SERVICE_NAME} in cluster ${CLUSTER_NAME}"
+     rerun-job:
+          parameters:
+              job_name:
+                  type: string
+              emoji:
+                  type: string
+              environment_name:
+                  type: string
+          steps:
+            - run:
+                name: Rerun K8s job << parameters.job_name >>
+                command: |
+                    kubectl get job -n jobs "<< parameters.job_name >>" -o json | \
+                    jq 'del(.spec.template.metadata.labels)' | \
+                    jq 'del(.spec.selector)' | \
+                    jq '.spec.parallelism=1' | \
+                    kubectl replace --force -f -
+            - run:
+                environment:
+                   EMOJI: << parameters.emoji >>
+                   SERVICE_NAME: << parameters.job_name >>
+                   CLUSTER_NAME: << parameters.environment_name >>
+                name: Notify slack
+                command: ./utilities/notify-slack.sh "${EMOJI} Running job \`${SERVICE_NAME}\` \`${CIRCLE_SHA1}\` (\`${CIRCLE_BRANCH}\`) in cluster ${CLUSTER_NAME}"
+     wait-for-service:
+          parameters:
+            service_name:
+               type: string
+            environment_name:
+               type: string
+            timeout:
+                type: integer
+                default: 5
+                description: "The amount of time to wait for the rollout to finish."
+          steps:
+              - run:
+                  name: Wait for << parameters.service_name >> to roll out.
+                  environment:
+                      SERVICE_NAME: << parameters.service_name >>
+                      ENV_NAME: << parameters.environment_name >>
+                      TIMEOUT: << parameters.timeout >>
+                  command: kubectl rollout status deployment/${SERVICE_NAME}-${ENV_NAME} -n ${SERVICE_NAME} --timeout ${TIMEOUT}m
+     kill-job:
+             parameters:
+                  job_name:
+                      type: string
+             steps:
+              - run:
+                  name: Kill job << parameters.job_name >> if its running
+                  environment:
+                        NAME: << parameters.job_name >>
+                  command: |
+                       ACTIVE=$(kubectl get jobs -n jobs ${NAME} -o jsonpath='{.status}' | jq '.active')
+                       [[ "${ACTIVE}" == "null" ]] && { echo "${NAME} is not active: exiting." ; exit 0; }
+                       kubectl patch job -n jobs ${NAME} -p '{"spec":{"parallelism":0}}'
+                       ./utilities/notify-slack.sh ":burning-moneybag: Killing unfinished \`${NAME}\` job."
+     wait-for-job:
+          parameters:
+               job_name:
+                   type: string
+               timeout:
+                   type: integer
+                   default: 10
+                   description: "The amount of time to wait for the job to complete."
+               namespace:
+                   description: "The namespace the jobs are in"
+                   type: string
+                   default: "jobs"
+          steps:
+           - run:
+               name: Wait for << parameters.job_name >> to complete.
+               environment:
+                   JOB_NAME: << parameters.job_name >>
+                   TIMEOUT: << parameters.timeout >>
+                   NAMESPACE: << parameters.namespace >>
+               command: kubectl wait --for=condition=complete --timeout ${TIMEOUT}m ${NAMESPACE}/${JOB_NAME} -n ${NAMESPACE}

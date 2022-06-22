@@ -1,0 +1,161 @@
+version: 2.1
+orbs: 
+   gradle: circleci/gradle@2.2.0
+   slack: circleci/slack@4.9.3
+executors: 
+  gradle-executor:
+     docker:
+      - image: cimg/openjdk:18.0.1
+        name: gradle-image
+      - image: cimg/redis:6.2
+        name: redis
+references: 
+    postgres_environment: &postgres_environment
+      environment:
+         POSTGRES_USER: "root"
+         POSTGRES_DB: "brace"
+         POSTGRES_PASSWORD: "u2VMsVTK3DPAa7h+>D6VB#7q8.j7FHHhBd]6dZcY]qnokKVRM{F+BUcNj.B&3oP6"
+         POSTGRES_HOSTNAME: "postgres"
+      image: cimg/elixir:1.13.4-erlang-24.3
+      <<: *postgres_environment
+    gradle_image: &gradle_image
+      image: gradle:7.4-jdk17
+    postgres_image: &postgres_image
+      image: cimg/postgres:13.4
+      name: postgres
+      command: ["postgres", "-c", "wal_level=logical"]
+      <<: *postgres_environment
+    setup_gradle_ci_init: &setup_gradle_ci_init
+      run: mkdir -p ~/.gradle && cp gradle/init-with-moved-buildDir.gradle ~/.gradle/init.gradle
+
+    generate_gradle_cache_seed: &generate_gradle_cache_seed
+      run: find . -name 'build.gradle.kts' | sort | xargs cat | shasum | awk '{print $1}' > /tmp/gradle_cache_seed
+    restore_gradle_cache: &restore_gradle_cache
+      restore_cache:
+        key: gradle-v1-{{ checksum "/tmp/gradle_cache_seed" }}-{{ checksum ".circleci/config.yml" }}
+    save_gradle_cache: &save_gradle_cache
+      save_cache:
+        paths:
+        - "~/.gradle/caches"
+        - "~/.gradle/wrapper"
+        key: gradle-v1-{{ checksum "/tmp/gradle_cache_seed" }}-{{ checksum ".circleci/config.yml" }}
+    workspace_root: &workspace_root /tmp/workspace
+    attach_workspace: &attach_workspace
+      attach_workspace:
+         at: *workspace_root
+    shallow_checkout: &SHALLOW_CHECKOUT
+      run:
+         name: Shallow repository checkout
+         command: |
+           mkdir -p $HOME/.ssh
+           ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+           cd ~
+           rm -r ~/project
+           BRANCH=$CIRCLE_BRANCH
+           if [ -z "$BRANCH" ];
+           then
+           BRANCH=$CIRCLE_TAG
+           fi
+           git clone --single-branch --depth 1 "$CIRCLE_REPOSITORY_URL" --branch "$BRANCH" ~/project
+    slack_notify_failure: &SLACK_NOTIFY_FAIL
+      slack/notify:
+         branch_pattern: main
+         event: fail
+         template: basic_fail_1
+jobs: 
+  backend-build:
+    docker:
+      - *gradle_image
+      #Needed for compile time query checking
+      - *postgres_image
+    resource_class: large
+    steps:
+      - *SHALLOW_CHECKOUT
+      - *attach_workspace
+      - *setup_gradle_ci_init
+      - *generate_gradle_cache_seed
+      - *restore_gradle_cache
+      #See https://circleci.com/docs/2.0/databases/#using-dockerize-to-wait-for-dependencies
+      - run:
+          name: install dockerize
+          command: wget https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSION/dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz && tar -C /usr/local/bin -xzvf dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz && rm dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz
+          environment:
+            DOCKERIZE_VERSION: v0.6.1
+      - run:
+          name: Wait for postgres to start up
+          command: dockerize -wait tcp://postgres:5432 -timeout 2m
+      - run:
+          name: Build all shadowDistTars
+          environment:
+            IS_CI_CD: "true"
+          #Gradle automatically pushes this command upward and calls shadowDistTar in all projects from this
+          command: |
+            export CI_COMMIT_SHA="${CIRCLE_SHA1}"
+            export GIT_DESCRIBE=$(cat /tmp/workspace/git/describe)
+            gradle shadowDistTar --build-cache --parallel
+      - *save_gradle_cache
+      - run: |
+          mkdir -p /tmp/workspace/shadow
+          cd /tmp/gradle-build/brace
+          find . -type f -name '*-shadow.tar' -exec cp '{}' /tmp/workspace/shadow ';'
+      - run:
+          name: Persist DB utils shadowjar (FIXME)
+          command: mv /tmp/gradle-build/brace/database-test-utils/libs/* /tmp/workspace/shadow
+      - persist_to_workspace:
+          root: *workspace_root
+          paths:
+            - shadow
+      - *SLACK_NOTIFY_FAIL
+
+
+      
+###########################  Our private Orbs commands ############################################################################## 
+commands: 
+  backend-test:
+    parameters:
+      project:
+        type: string
+      buildSubdir:
+        type: string
+      test_name:
+        type: string
+    steps:
+      - checkout
+      - attach_workspace: 
+          at: /tmp/workspace
+      - run:
+          name: setup_gradle_ci_init
+          command: mkdir -p ~/.gradle && cp gradle/init-with-moved-buildDir.gradle ~/.gradle/init.gradle
+      - run: 
+          name: generate_gradle_cache_seed
+          command: find . -name 'build.gradle.kts' | sort | xargs cat | shasum | awk '{print $1}' > /tmp/gradle_cache_seed
+      - run:
+          name: restore_gradle_cache
+          command: gradle-v1-{{ checksum "/tmp/gradle_cache_seed" }}-{{ checksum ".circleci/config.yml" }}
+      #See https://circleci.com/docs/2.0/databases/#using-dockerize-to-wait-for-dependencies
+      - run:
+          name: install dockerize
+          command: wget https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSION/dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz && tar -C /usr/local/bin -xzvf dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz && rm dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz
+          environment:
+            DOCKERIZE_VERSION: v0.6.1
+      - run:
+          name: Wait for postgres to start up
+          command: dockerize -wait tcp://postgres:5432 -timeout 2m
+      - run:
+          environment:
+            ENVIRONMENT: TEST
+            IS_CI_CD: "true"
+          command: gradle :backend:<< parameters.project >>:<< parameters.test_name >> :backend:<< parameters.project >>:writeSuccessfulOutput --build-cache
+      - run:
+          name: Ensure that test results were generated
+          environment:
+            RESULTS_PATH: /tmp/gradle-build/brace/<< parameters.buildSubdir >>/ci-checkpoint/success.txt
+          command: stat $RESULTS_PATH
+      - save_cache:
+          paths:
+          - "~/.gradle/caches"
+          - "~/.gradle/wrapper"
+          key: gradle-v1-{{ checksum "/tmp/gradle_cache_seed" }}-{{ checksum ".circleci/config.yml" }}
+      - gradle/collect_test_results:
+          test_results_path: /tmp/gradle-build/brace/<< parameters.buildSubdir >>/test-results
+          reports_path: /tmp/gradle-build/brace/<< parameters.buildSubdir >>/reports/tests/<< parameters.test_name >>/
